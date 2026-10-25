@@ -1,0 +1,456 @@
+diff -ruN a/conev.c b/conev.c
+--- a/conev.c
++++ b/conev.c
+@@ -5,6 +5,9 @@
+ #include <limits.h>
+ #include <assert.h>
+ 
++#include "error.h"
++#include "params.h"
++
+ 
+ struct poolhd *init_pool(int count)
+ {
+@@ -45,6 +48,7 @@
+ {
+     assert(fd > 0);
+     if (pool->count >= pool->max) {
++        LOG(LOG_E, "add_event: pool is full\n");
+         return 0;
+     }
+     struct eval *val = pool->links[pool->count];
+diff -ruN a/desync.c b/desync.c
+--- a/desync.c
++++ b/desync.c
+@@ -258,7 +258,54 @@
+     return len;
+ }
+ #else
+-OVERLAPPED ov = {};
++// Backport of upstream 2e244fd (v0.13.1) and 41ffee5: the temp file
++// must stay open while TransmitFile may still retransmit from it,
++// so handles live in a ring and are closed only when reused
++#define MAX_TFILES 32
++
++int tfiles_count = 0;
++HANDLE tfiles[MAX_TFILES] = { 0 };
++OVERLAPPED tfiles_ov[MAX_TFILES] = { 0 };
++
++
++static HANDLE openTFile(OVERLAPPED **ov)
++{
++    if (tfiles_count == MAX_TFILES) {
++        tfiles_count = 0;
++    }
++    HANDLE *p = &tfiles[tfiles_count];
++    if (*p) {
++        if (!CloseHandle(*p)) {
++            uniperror("CloseHandle");
++        }
++        *p = 0;
++    }
++    char path[MAX_PATH], temp[MAX_PATH + 1];
++    int ps = GetTempPath(sizeof(temp), temp);
++    if (!ps) {
++        uniperror("GetTempPath");
++        return 0;
++    }
++    if (!GetTempFileName(temp, "t", 0, path)) {
++        uniperror("GetTempFileName");
++        return 0;
++    }
++    LOG(LOG_L, "temp file: %s\n", path);
++
++    HANDLE hfile = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
++        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS,
++        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
++    if (hfile == INVALID_HANDLE_VALUE) {
++        uniperror("CreateFileA");
++        return 0;
++    }
++    *ov = &tfiles_ov[tfiles_count];
++    memset(*ov, 0, sizeof(**ov));
++    *p = hfile;
++    tfiles_count++;
++    return hfile;
++}
++
+ 
+ ssize_t send_fake(int sfd, char *buffer,
+         int cnt, long pos, int fa, struct desync_params *opt)
+@@ -272,41 +319,23 @@
+     }
+     size_t psz = pkt.size;
+     if (opt->fake_offset) {
+-        if (psz > opt->fake_offset) { 
++        if (psz > opt->fake_offset) {
+             psz -= opt->fake_offset;
+             pkt.data += opt->fake_offset;
+         }
+         else psz = 0;
+     }
+-    
+-    char path[MAX_PATH], temp[MAX_PATH + 1];
+-    int ps = GetTempPath(sizeof(temp), temp);
+-    if (!ps) {
+-        uniperror("GetTempPath");
+-        return -1;
+-    }
+-    if (!GetTempFileName(temp, "t", 0, path)) {
+-        uniperror("GetTempFileName");
+-        return -1;
+-    }
+-    LOG(LOG_L, "temp file: %s\n", path);
+-    
+-    HANDLE hfile = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 
+-        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, 
+-        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+-    if (hfile == INVALID_HANDLE_VALUE) {
+-        uniperror("CreateFileA");
++
++    OVERLAPPED *ov = 0;
++    HANDLE hfile = openTFile(&ov);
++    if (!hfile) {
+         return -1;
+     }
+     ssize_t len = -1;
+-    
++
+     while (1) {
+-        ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+-        if (!ov.hEvent) {
+-            uniperror("CreateEvent");
+-             break;
+-        }
+-        if (!WriteFile(hfile, pkt.data, psz < pos ? psz : pos, 0, 0)) {
++        DWORD wrtcnt = 0;
++        if (!WriteFile(hfile, pkt.data, psz < pos ? psz : pos, &wrtcnt, 0)) {
+             uniperror("WriteFile");
+             break;
+         }
+@@ -327,7 +356,7 @@
+         if (setttl(sfd, opt->ttl ? opt->ttl : 8, fa) < 0) {
+             break;
+         }
+-        if (!TransmitFile(sfd, hfile, pos, pos, &ov, 
++        if (!TransmitFile(sfd, hfile, pos, pos, ov,
+                 NULL, TF_USE_KERNEL_APC | TF_WRITE_BEHIND)) {
+             if ((GetLastError() != ERROR_IO_PENDING) 
+                         && (WSAGetLastError() != WSA_IO_PENDING)) {
+@@ -341,7 +370,7 @@
+             uniperror("SetFilePointer");
+             break;
+         }
+-        if (!WriteFile(hfile, buffer, pos, 0, 0)) {
++        if (!WriteFile(hfile, buffer, pos, &wrtcnt, 0)) {
+             uniperror("WriteFile");
+             break;
+         }
+@@ -351,11 +380,6 @@
+         len = pos;
+         break;
+     }
+-    if (!CloseHandle(hfile)
+-            || (ov.hEvent && !CloseHandle(ov.hEvent))) {
+-        uniperror("CloseHandle");
+-        return -1;
+-    }
+     return len;
+ }
+ #endif
+diff -ruN a/extend.c b/extend.c
+--- a/extend.c
++++ b/extend.c
+@@ -6,6 +6,12 @@
+     #ifndef TCP_MAXRT
+     #define TCP_MAXRT 5
+     #endif
++    #ifndef IP_UNICAST_IF
++    #define IP_UNICAST_IF 31
++    #endif
++    #ifndef IPV6_UNICAST_IF
++    #define IPV6_UNICAST_IF 31
++    #endif
+ #else
+     #include <arpa/inet.h>
+     #include <netinet/tcp.h>
+@@ -110,8 +116,51 @@
+ }
+ 
+ 
++int bind_out_if(int fd, int family, int need6)
++{
++    #ifdef _WIN32
++    static int warned6 = 0;
++    if (!params.out_if) {
++        return 0;
++    }
++    // IPv4 index is in network byte order, IPv6 in host order.
++    // IPv4 traffic uses plain IPv4 sockets (split_stack in proxy.c).
++    // IPV6_UNICAST_IF fails (WSAEINVAL) if IPv6 is unbound on the
++    // interface, which only matters for real IPv6 destinations
++    DWORD idx4 = htonl(params.out_if), idx6 = params.out_if;
++
++    if (setsockopt(fd, IPPROTO_IP, IP_UNICAST_IF,
++            (char *)&idx4, sizeof(idx4)) && family == AF_INET) {
++        uniperror("setsockopt IP_UNICAST_IF");
++        return -1;
++    }
++    if (family == AF_INET6 && setsockopt(fd, IPPROTO_IPV6,
++            IPV6_UNICAST_IF, (char *)&idx6, sizeof(idx6))) {
++        if (need6) {
++            uniperror("setsockopt IPV6_UNICAST_IF");
++            return -1;
++        }
++        if (!warned6) {
++            warned6 = 1;
++            LOG(LOG_E, "IPv6 unavailable on interface %u, IPv4 only\n", params.out_if);
++        }
++    }
++    #endif
++    return 0;
++}
++
++
+ int socket_mod(int fd, struct sockaddr *dst)
+ {
++    int need6 = 0;
++    #ifdef _WIN32
++    if (dst->sa_family == AF_INET6) {
++        need6 = !IN6_IS_ADDR_V4MAPPED(&((struct sockaddr_in6 *)dst)->sin6_addr);
++    }
++    #endif
++    if (bind_out_if(fd, dst->sa_family, need6) < 0) {
++        return -1;
++    }
+     if (params.custom_ttl) {
+         if (setttl(fd, params.def_ttl, get_family(dst)) < 0) {
+             return -1;
+diff -ruN a/extend.h b/extend.h
+--- a/extend.h
++++ b/extend.h
+@@ -7,6 +7,8 @@
+ 
+ int socket_mod(int fd, struct sockaddr *dst);
+ 
++int bind_out_if(int fd, int family, int need6);
++
+ int connect_hook(struct poolhd *pool, struct eval *val, 
+         struct sockaddr_ina *dst, int next);
+         
+diff -ruN a/main.c b/main.c
+--- a/main.c
++++ b/main.c
+@@ -68,6 +68,9 @@
+     "    -b, --buf-size <size>     Buffer size, default 16384\n"
+     "    -x, --debug <level>       Print logs, 0, 1 or 2\n"
+     "    -g, --def-ttl <num>       TTL for all outgoing connections\n"
++    #ifdef _WIN32
++    "    -Z, --out-if <index>      Send outgoing traffic via interface index\n"
++    #endif
+     // desync options
+     #ifdef TCP_FASTOPEN_CONNECT
+     "    -F, --tfo                 Enable TCP Fast Open\n"
+@@ -152,6 +155,9 @@
+     {"tlsrec",        1, 0, 'r'},
+     {"udp-fake",      1, 0, 'a'},
+     {"def-ttl",       1, 0, 'g'},
++    #ifdef _WIN32
++    {"out-if",        1, 0, 'Z'},
++    #endif
+     {"delay",         1, 0, 'w'}, //
+     {"not-wait-send", 0, 0, 'W'}, //
+     #ifdef __linux__
+@@ -810,6 +816,14 @@
+         case 'Y':
+             dp->drop_sack = 1;
+             break;
++
++        case 'Z':
++            val = strtol(optarg, &end, 0);
++            if (val <= 0 || *end)
++                invalid = 1;
++            else
++                params.out_if = val;
++            break;
+             
+         case 'w': //
+             params.sfdelay = strtol(optarg, &end, 0);
+diff -ruN a/params.h b/params.h
+--- a/params.h
++++ b/params.h
+@@ -108,6 +108,7 @@
+     struct mphdr *mempool;
+     
+     char *protect_path;
++    unsigned int out_if;
+ };
+ 
+ extern struct params params;
+diff -ruN a/proxy.c b/proxy.c
+--- a/proxy.c
++++ b/proxy.c
+@@ -315,17 +315,44 @@
+ }
+ 
+ 
++// Windows ignores IP_UNICAST_IF on dual-stack sockets, so with --out-if
++// and the default "::" bind address IPv4 traffic uses plain IPv4 sockets
++static int split_stack(void)
++{
++    #ifdef _WIN32
++    return params.out_if && params.baddr.sin6_family == AF_INET6
++        && IN6_IS_ADDR_UNSPECIFIED(&params.baddr.sin6_addr);
++    #else
++    return 0;
++    #endif
++}
++
++
++// Socket family and bind address for a destination; a UDP relay uses
++// one socket, which is IPv4 in split-stack mode
++static void out_addr(struct sockaddr_ina *dst, struct sockaddr_ina *baddr, int udp)
++{
++    memset(baddr, 0, sizeof(*baddr));
++    baddr->in6 = params.baddr;
++    if (split_stack()) {
++        map_fix(dst, 0);
++        if (udp || dst->sa.sa_family == AF_INET) {
++            memset(baddr, 0, sizeof(*baddr));
++            baddr->in.sin_family = AF_INET;
++        }
++        return;
++    }
++    map_fix(dst, baddr->sa.sa_family == AF_INET6 ? 6 : 0);
++}
++
++
+ int create_conn(struct poolhd *pool,
+         struct eval *val, struct sockaddr_ina *dst, int next)
+ {
+-    struct sockaddr_ina addr = *dst;
+-    
+-    if (params.baddr.sin6_family == AF_INET6) {
+-        map_fix(&addr, 6);
+-    } else {
+-        map_fix(&addr, 0);
+-    }
+-    if (addr.sa.sa_family != params.baddr.sin6_family) {
++    struct sockaddr_ina addr = *dst, baddr;
++
++    out_addr(&addr, &baddr, 0);
++    if (addr.sa.sa_family != baddr.sa.sa_family) {
+         LOG(LOG_E, "different addresses family\n");
+         return -1;
+     }
+@@ -347,9 +374,8 @@
+             return -1;
+         }
+     }
+-    if (bind(sfd, (struct sockaddr *)&params.baddr, 
+-            SA_SIZE(&params.baddr)) < 0) {
+-        uniperror("bind");  
++    if (bind(sfd, &baddr.sa, SA_SIZE(&baddr)) < 0) {
++        uniperror("bind");
+         close(sfd);
+         return -1;
+     }
+@@ -415,14 +441,15 @@
+ int udp_associate(struct poolhd *pool, 
+         struct eval *val, struct sockaddr_ina *dst)
+ {
+-    struct sockaddr_ina addr = *dst;
+-    
+-    int ufd = nb_socket(params.baddr.sin6_family, SOCK_DGRAM);
++    struct sockaddr_ina addr = *dst, baddr;
++
++    out_addr(&addr, &baddr, 1);
++    int ufd = nb_socket(baddr.sa.sa_family, SOCK_DGRAM);
+     if (ufd < 0) {
+-        uniperror("socket");  
++        uniperror("socket");
+         return -1;
+     }
+-    if (params.baddr.sin6_family == AF_INET6) {
++    if (baddr.sa.sa_family == AF_INET6) {
+         int no = 0;
+         if (setsockopt(ufd, IPPROTO_IPV6,
+                 IPV6_V6ONLY, (char *)&no, sizeof(no))) {
+@@ -430,11 +457,13 @@
+             close(ufd);
+             return -1;
+         }
+-        map_fix(&addr, 6);
+     }
+-    if (bind(ufd, (struct sockaddr *)&params.baddr, 
+-            SA_SIZE(&params.baddr)) < 0) {
+-        uniperror("bind");  
++    if (bind(ufd, &baddr.sa, SA_SIZE(&baddr)) < 0) {
++        uniperror("bind");
++        close(ufd);
++        return -1;
++    }
++    if (bind_out_if(ufd, baddr.sa.sa_family, 0) < 0) {
+         close(ufd);
+         return -1;
+     }
+@@ -482,7 +511,8 @@
+         return -1;
+     }
+     struct eval *client = add_event(pool, EV_UDP_TUNNEL, cfd, POLLIN);
+-    if (!pair) {
++    // upstream 663cbf8: v0.13 checked pair here and crashed on a full pool
++    if (!client) {
+         del_event(pool, pair);
+         close(cfd);
+         return -1;
+@@ -533,10 +563,18 @@
+         int c = accept(val->fd, &client.sa, &len);
+         #endif
+         if (c < 0) {
+-            if (get_e() == EAGAIN ||
+-                    get_e() == EINPROGRESS)
++            int e = get_e();
++            if (e == EAGAIN || e == EINPROGRESS)
+                 break;
+             uniperror("accept");
++            #ifdef _WIN32
++            // a client that gave up while queued must not stop the server;
++            // running out of sockets is retried on the next event
++            if (e == ECONNRESET || e == WSAECONNABORTED)
++                continue;
++            if (e == WSAEMFILE || e == WSAENOBUFS)
++                break;
++            #endif
+             return -1;
+         }
+         LOG(LOG_S, "accept: fd=%d\n", c);
+@@ -695,10 +733,9 @@
+                 return -1;
+             }
+             if (!val->pair->in6.sin6_port) {
+-                if (params.baddr.sin6_family == AF_INET6) {
+-                    map_fix(&addr, 6);
+-                }
+-                if (params.baddr.sin6_family != addr.sa.sa_family) {
++                struct sockaddr_ina baddr;
++                out_addr(&addr, &baddr, 1);
++                if (baddr.sa.sa_family != addr.sa.sa_family) {
+                     return -1;
+                 }
+                 if (socket_mod(val->pair->fd, &addr.sa) < 0) {
+@@ -958,7 +995,13 @@
+         close(srvfd);
+         return -1;
+     }
+-    if (listen(srvfd, 10)) {
++    #ifdef _WIN32
++    // in VPN mode every new connection of the PC arrives here, often in bursts
++    int backlog = SOMAXCONN;
++    #else
++    int backlog = 10;
++    #endif
++    if (listen(srvfd, backlog)) {
+         uniperror("listen");
+         close(srvfd);
+         return -1;

@@ -1,0 +1,12 @@
+# Build output: build.ps1 recreates these. Publish the zip as a GitHub release instead.
+/build/
+/dist/
+
+# The Android app this port was made from (download it from ByeDPIAndroid's releases)
+*.apk
+
+# Editors / OS
+.vs/
+.vscode/
+Thumbs.db
+desktop.ini
